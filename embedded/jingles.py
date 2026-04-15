@@ -16,17 +16,23 @@ class Jingle:
         self.buzzer.off()
 
     async def play(self, file):
+        """Play a jingle file asynchronously."""
         with open(f"aud_jingles/{file}") as jingle_file:
             self.buzzer.on()
             for action in jingle_file:
-                action_split = action.split('#', 1)[0].split(' ', 1)
-                note = action_split[0]
-                duration = float(action_split[1])
-                # FIXME (willnilges): This code is probably slow.
-                if "rest" in note:
-                    # Turn off the buzzer for a specified period
+                line = action.split('#', 1)[0].strip()
+                if not line:
+                    continue
+                try:
+                    note, duration_str = line.split(None, 1) 
+                    duration = float(duration_str)
+                except ValueError:
+                    print("bro what")
+                    continue
+
+                if note.lower() == "rest":
                     self.buzzer.off()
-                    time.sleep(duration)
+                    await asyncio.sleep(duration)
                     self.buzzer.on()
                 elif note.isdigit():
                     # Try playing as hz
@@ -37,5 +43,5 @@ class Jingle:
                     # play a specified note
                     self.buzzer.note(note)
                     await asyncio.sleep(duration)
-            self.buzzer.off()
 
+            self.buzzer.off()
