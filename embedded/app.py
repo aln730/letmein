@@ -1,161 +1,136 @@
 import asyncio
-from gpio import *
-from secrets import *
-from art import art_ready
+from secrets import secrets
+
+LOCATION_NAMES = {
+    "n_stairs": "North Side Stairwell",
+    "s_stairs": "South Side Stairwell",
+    "level_a":  "Level A Elevator",
+    "level_1":  "Level 1 Elevator",
+    "l_well":   "L Well",
+}
+
+JINGLE_FILES = {
+    "n_stairs": "n_stairs.jingle",
+    "s_stairs": "s_stairs.jingle",
+    "level_a":  "level_a.jingle",
+    "level_1":  "tron.jingle",
+    "l_well":   "l_well.jingle",
+}
+
+JINGLE_BOOT = "tron.jingle"
+JINGLE_ACK  = "ack.jingle"
+
 
 class App:
-    buffer = []
-    def __init__(self, mqtt_client, jingle):
-        self.mqtt_client = mqtt_client
-        self.jingle = jingle
-        self.stfu_counter = 0
+    def __init__(self, mqtt_client, jingle, lcd, backlight, ack):
+        self.mqtt     = mqtt_client
+        self.jingle   = jingle
+        self.lcd      = lcd
+        self.backlight = backlight
+        self.ack      = ack
 
-        self.mqtt_client.on_message = self.message
+        self.current_location = None
+        self.location_loops   = {}
 
-    def launch(self):
-        asyncio.run(self.run())
+        self.mqtt.on_message = self._on_message
 
-    async def run(self):
-        # Jingle + ASCII art to let the user know the board is ready to go
-        # Fancy :)
-        sound_ready_task = asyncio.create_task(self.jingle.play("ready.jingle"))
-        light_show_task = asyncio.create_task(light_show())
-        await asyncio.gather(sound_ready_task, light_show_task)
-        art_ready()
-        check_ack_task = asyncio.create_task(self.check_ack())
-        check_jingle_task = asyncio.create_task(self.check_jingle())
-        check_mqtt_task = asyncio.create_task(self.check_mqtt())
-        check_stfu_task = asyncio.create_task(self.check_stfu())
-        stfu_decay_task = asyncio.create_task(self.stfu_decay())
-        await asyncio.gather(
-            check_ack_task,
-            check_jingle_task,
-            check_mqtt_task,
-            check_stfu_task,
-            stfu_decay_task
+    # Display
+
+    def _show_location(self, location_code, name):
+        location = LOCATION_NAMES.get(location_code, location_code)
+        self.lcd.clear()
+        self.lcd.message = (
+            "Name:\n"
+            f"{name[:20]}\n"
+            "Location:\n"
+            f"{location[:20]}"
         )
 
-    # Run MQTT transactions
-    async def check_mqtt(self):
-        while True:
-            if self.jingle.buzzer.is_off():
-                self.mqtt_client.loop()
-            await asyncio.sleep(1)
+    # Jingle Jangle
 
-    # See if the button is being pressed
-    async def check_ack(self):
-        while True:
-            if ack.value:
-                self.mqtt_client.publish(mqtt_ack_topic, f"{secrets['location']}")
+    async def _loop_jingle(self, file, location_code):
+        while location_code in self.location_loops:
+            try:
+                await self.jingle.play(file)
+            except FileNotFoundError:
+                print(f"[ERROR] Missing jingle: {file}")
+                break
+            except asyncio.CancelledError:
                 self.jingle.buzzer.off()
-                all_off()
-            await asyncio.sleep(0.5)
+                break
+            await asyncio.sleep(0)
 
-    async def check_stfu(self):
+    def _stop_all_jingles(self):
+        for loc, task in list(self.location_loops.items()):
+            task.cancel()
+            del self.location_loops[loc]
+        self.jingle.buzzer.off()
+
+    # MQTT
+
+    def _on_message(self, client, topic, msg):
+        msg_str = msg.decode() if isinstance(msg, bytes) else str(msg)
+
+        if topic == "letmein2/req":
+            self.current_location = msg_str
+
+        elif topic == "letmein2/name":
+            if self.current_location is None:
+                return
+
+            self.backlight.value = True
+            self._show_location(self.current_location, msg_str)
+
+            file = JINGLE_FILES.get(self.current_location)
+            if file and self.current_location not in self.location_loops:
+                task = asyncio.create_task(
+                    self._loop_jingle(file, self.current_location)
+                )
+                self.location_loops[self.current_location] = task
+
+    # Ackkkkkk
+
+    async def _handle_ack(self):
         while True:
-            if stfu.value:
-                if led_stfu.value:
-                    self.stfu_counter = 0
-                    self.mqtt_client.subscribe(mqtt_req_topic)
-                else:
-                    # Scale the counter to seconds (since the counter counts down once per second-ish)
-                    # FIXME (willnilges): I think each tick is a bit longer than a second so keep that
-                    # in mind when you're setting duration
-                    self.stfu_counter = stfu_duration_minutes * 60
-                    self.mqtt_client.unsubscribe(mqtt_req_topic)
-                # We're gonna use the LED to keep track of the status b/c we're goblins.
-                led_stfu.value = not led_stfu.value
-            await asyncio.sleep(0.5)
+            if self.ack.value:
+                print("[INPUT] Button pressed!")
+                self._stop_all_jingles()
+                await asyncio.sleep(0.5)
 
-    async def stfu_decay(self):
+                self.lcd.clear()
+                self.lcd.message = "CHOMMMMMMMMMMMMMMMMM"
+                await asyncio.sleep(2)
+
+                self.lcd.clear()
+                self.backlight.value = False
+                self.mqtt.publish("letmein2/ack", secrets["location"])
+                await asyncio.sleep(1)
+
+            await asyncio.sleep(0.05)
+
+    # Moop
+
+    async def _mqtt_loop(self):
         while True:
-            if led_stfu.value:
-                if self.stfu_counter > 0:
-                    self.stfu_counter -= 1
-                    print(f"stfu_counter = {self.stfu_counter}")
-                else:
-                    led_stfu.value = 0
-                    self.mqtt_client.subscribe(mqtt_req_topic)
-            await asyncio.sleep(1)
+            self.mqtt.loop()
+            await asyncio.sleep(0)
 
-    # Check if we should be playing music, and play music if so
-    async def check_jingle(self):
-        while True:
-            if self.jingle.buzzer.is_off():
-                # Probably has a bug: If one light is playing its jingle, then
-                # another higher up on this list lights up, it'll switch songs
-                # to the new light.
-                if s_stairs.value:
-                    await self.jingle.play(jingle_s_stairs)
-                elif n_stairs.value:
-                    await self.jingle.play(jingle_n_stairs)
-                elif level_a.value:
-                    await self.jingle.play(jingle_level_a)
-                elif level_1.value:
-                    await self.jingle.play(jingle_level_1)
-                elif l_well.value:
-                    await self.jingle.play(jingle_l_well)
-                elif len(self.buffer):
-                    first_item = self.buffer.pop(0)
-                    if first_item == "timeout":
-                        await self.jingle.play(jingle_timeout)
-                    elif first_item == "ack":
-                        await self.jingle.play(jingle_ack)
-                    elif first_item == "nvm":
-                        await self.jingle.play(jingle_nvm)
-            await asyncio.sleep(1)
+    async def _run(self):
+        try:
+            await self.jingle.play(JINGLE_BOOT)
+        except FileNotFoundError:
+            print("[WARN] Missing boot jingle")
 
-    # MQTT message handler
-    def message(self, client, topic, message):
-        # Method called when a client's subscribed feed has a new value.
-        print("New message on topic {0}: {1}".format(topic, message))
-        if topic == mqtt_req_topic:
-            pencil.value = 1
-            if message == "level_a":
-                level_a.value = 1
-            elif message == "level_1":
-                level_1.value = 1
-            elif message == "s_stairs":
-                s_stairs.value = 1
-            elif message == "n_stairs":
-                n_stairs.value = 1
-            elif message == "l_well":
-                l_well.value = 1
-        elif topic == mqtt_ack_topic:
-            # FIXME (willnilges): The MQTT client is still subbed so it gets
-            # messages and turns on the lights, but then it just turns right
-            # back off. Should fix this. IDEA: Sub/Unsub.
-            # TODO (willnilges): Perhaps a timeout topic would be nice.
-            self.buffer.append("ack")
-            all_off()
-        elif topic == mqtt_timeout_topic:
-            pencil.value = 0
-            if "level_a" in message:
-                level_a.value = 0
-            elif "level_1" in message:
-                level_1.value = 0
-            elif "s_stairs" in message:
-                s_stairs.value = 0
-            elif "n_stairs" in message:
-                n_stairs.value = 0
-            elif "l_well" in message:
-                l_well.value = 0
-            self.buffer.append("timeout")
-        elif topic == mqtt_nvm_topic:
-            # TODO: Set up some kind of configurable dingus for this (and other)
-            # location-based trees
-            self.jingle.buzzer.off()
-            pencil.value = 0
-            if "level_a" in message:
-                level_a.value = 0
-            elif "level_1" in message:
-                level_1.value = 0
-            elif "s_stairs" in message:
-                s_stairs.value = 0
-            elif "n_stairs" in message:
-                n_stairs.value = 0
-            elif "l_well" in message:
-                l_well.value = 0
-            self.buffer.append("nvm")
+        await asyncio.gather(
+            self._mqtt_loop(),
+            self._handle_ack(),
+        )
 
-
+    def launch(self):
+        try:
+            asyncio.run(self._run())
+        except KeyboardInterrupt:
+            print("Exiting...")
+            self._stop_all_jingles()
+            self.lcd.clear()
+            self.backlight.value = False
